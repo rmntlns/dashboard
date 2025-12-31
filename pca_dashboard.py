@@ -133,37 +133,78 @@ MONGODB_COLLECTION=your_collection_name
     
     # Scatterplot - Full width
     st.subheader("🎯 Interactive PCA Scatterplot")
-    
+
     # Reset zoom button above chart
     if st.button("🔄 Reset Zoom", key="reset_zoom_top"):
         st.session_state.x_range = None
         st.session_state.y_range = None
         st.rerun()
-    
-    # Create Plotly scatterplot
+
+    # Prepare hover data - truncate long text for better display
+    df_plot = df.copy()
+    df_plot['question_short'] = df_plot['question'].apply(lambda x: str(x)[:100] + '...' if len(str(x)) > 100 else str(x))
+    df_plot['answer_short'] = df_plot['answer'].apply(lambda x: str(x)[:100] + '...' if len(str(x)) > 100 else str(x))
+
+    # Ensure usage_count exists, default to 0 if missing
+    if 'usage_count' not in df_plot.columns:
+        df_plot['usage_count'] = 0
+
+    # Create Plotly scatterplot with color coding based on usage_count
     fig = px.scatter(
-        df, 
-        x='Xpca', 
+        df_plot,
+        x='Xpca',
         y='Ypca',
-        title="PCA Coordinates Scatterplot",
-        labels={'Xpca': 'X PCA', 'Ypca': 'Y PCA'},
-        opacity=0.7
+        color='usage_count',
+        color_continuous_scale=['#808080', '#00FF00'],  # Gray to bright green
+        title="PCA Coordinates Scatterplot (Color: Usage Count)",
+        labels={
+            'Xpca': 'X PCA',
+            'Ypca': 'Y PCA',
+            'usage_count': 'Usage Count'
+        },
+        hover_data={
+            'Xpca': ':.4f',
+            'Ypca': ':.4f',
+            'id': True,
+            'usage_count': True,
+            'question_short': True,
+            'answer_short': True
+        },
+        custom_data=['id', 'usage_count', 'question_short', 'answer_short']
     )
-    
+
+    # Update hover template for better formatting
+    fig.update_traces(
+        hovertemplate='<b>Chunk ID:</b> %{customdata[0]}<br>' +
+                      '<b>Usage Count:</b> %{customdata[1]}<br>' +
+                      '<b>X PCA:</b> %{x:.4f}<br>' +
+                      '<b>Y PCA:</b> %{y:.4f}<br>' +
+                      '<b>Question:</b> %{customdata[2]}<br>' +
+                      '<b>Answer:</b> %{customdata[3]}<br>' +
+                      '<extra></extra>'
+    )
+
     # Update layout for better interactivity
     fig.update_layout(
         height=600,
         dragmode='zoom',  # Enable zoom as default tool
         selectdirection='d',  # 'd' for diagonal selection
         title_x=0.5,
-        title_font_size=16
+        title_font_size=16,
+        coloraxis_colorbar=dict(
+            title="Usage Count",
+            thicknessmode="pixels",
+            thickness=15,
+            lenmode="pixels",
+            len=200
+        )
     )
-    
+
     # Update traces for better selection visibility
     fig.update_traces(
-        marker=dict(size=4),
-        selected=dict(marker=dict(opacity=1.0, size=6)),
-        unselected=dict(marker=dict(opacity=0.3, size=3))
+        marker=dict(size=6),
+        selected=dict(marker=dict(opacity=1.0, size=8)),
+        unselected=dict(marker=dict(opacity=0.3, size=4))
     )
     
     # Display the chart with selection events
@@ -176,63 +217,110 @@ MONGODB_COLLECTION=your_collection_name
     )
     
     # Handle selection events
+    selected_chunk_indices = []
+
     if event and event.selection and event.selection.box:
         # Extract box selection coordinates
         box_data = event.selection.box[0]  # Get first box selection
-        
+
         if 'x' in box_data and 'y' in box_data:
             # Extract selection coordinates from box and ensure proper min/max order
             x_coords = box_data['x']
             y_coords = box_data['y']
-            
+
             # Ensure we have min/max in correct order
             x_range = [min(x_coords), max(x_coords)]
             y_range = [min(y_coords), max(y_coords)]
-            
+
             # Update session state
             st.session_state.x_range = x_range
             st.session_state.y_range = y_range
-            
+
             st.success(f"🎯 Selected area: X: {x_range[0]:.4f} to {x_range[1]:.4f}, Y: {y_range[0]:.4f} to {y_range[1]:.4f}")
-    
+
     elif event and event.selection and event.selection.points:
         # Handle point selections - get bounding box of selected points
         points = event.selection.points
         if points:
+            # Store selected point indices for chunk info display
+            selected_chunk_indices = [point['point_index'] for point in points]
+
             x_coords = [point['x'] for point in points]
             y_coords = [point['y'] for point in points]
-            
+
             x_range = [min(x_coords), max(x_coords)]
             y_range = [min(y_coords), max(y_coords)]
-            
+
             # Add small buffer if single point selected
             if len(points) == 1:
                 x_buffer = 0.1
                 y_buffer = 0.1
                 x_range = [x_range[0] - x_buffer, x_range[1] + x_buffer]
                 y_range = [y_range[0] - y_buffer, y_range[1] + y_buffer]
-            
+
             # Update session state
             st.session_state.x_range = x_range
             st.session_state.y_range = y_range
-            
+
             st.success(f"🎯 Selected {len(points)} point(s): X: {x_range[0]:.2f} to {x_range[1]:.2f}, Y: {y_range[0]:.2f} to {y_range[1]:.2f}")
-    
+
     elif event and event.selection and event.selection.lasso:
         # Handle lasso selections - get bounding box of lasso area
         lasso_data = event.selection.lasso[0]
         if 'x' in lasso_data and 'y' in lasso_data:
             x_coords = lasso_data['x']
             y_coords = lasso_data['y']
-            
+
             x_range = [min(x_coords), max(x_coords)]
             y_range = [min(y_coords), max(y_coords)]
-            
+
             # Update session state
             st.session_state.x_range = x_range
             st.session_state.y_range = y_range
-            
+
             st.success(f"🎯 Lasso selected area: X: {x_range[0]:.2f} to {x_range[1]:.2f}, Y: {y_range[0]:.2f} to {y_range[1]:.2f}")
+
+    # Display Chunk Info Card for selected points
+    if selected_chunk_indices:
+        st.markdown("---")
+        st.subheader("📋 Selected Chunk Details")
+
+        # Display info for each selected chunk
+        for idx in selected_chunk_indices:
+            if idx < len(df):
+                chunk = df.iloc[idx]
+
+                with st.container():
+                    st.markdown(f"""
+                    <div style="background-color: #f0f2f6; padding: 10px 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #00FF00;">
+                        <p style="margin: 0; font-size: 14px; font-weight: 600; color: #1f77b4;">🔖 Chunk ID: {chunk.get('id', 'N/A')}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.markdown("**📍 PCA Coordinates**")
+                        st.write(f"• X: `{chunk.get('Xpca', 'N/A'):.6f}`")
+                        st.write(f"• Y: `{chunk.get('Ypca', 'N/A'):.6f}`")
+
+                    with col2:
+                        st.markdown("**📊 Lifetime Usage Count**")
+                        usage = chunk.get('usage_count', 0)
+                        st.markdown(f"<h2 style='color: #00FF00; margin: 0;'>{usage}</h2>", unsafe_allow_html=True)
+
+                    st.markdown("---")
+
+                    st.markdown("**❓ Question**")
+                    st.info(chunk.get('question', 'N/A'))
+
+                    st.markdown("**💡 Answer**")
+                    st.success(chunk.get('answer', 'N/A'))
+
+                    if len(selected_chunk_indices) > 1:
+                        st.markdown("---")
+
+        st.markdown("---")
     
 
     
