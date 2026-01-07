@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -17,22 +18,22 @@ st.set_page_config(
 )
 
 @st.cache_data
-def get_mongodb_data():
-    """Fetch all records from MongoDB"""
+def get_chunks_data():
+    """Fetch all chunks from MongoDB"""
     try:
         # Get MongoDB connection details from environment variables
         mongo_uri = os.getenv("MONGODB_URI")
         database_name = os.getenv("MONGODB_DATABASE")
-        collection_name = os.getenv("MONGODB_COLLECTION")
-        
+        chunks_collection_name = os.getenv("MONGODB_CHUNKS_COLLECTION", "chunks")
+
         # Connect to MongoDB
         client = MongoClient(mongo_uri)
         db = client[database_name]
-        collection = db[collection_name]
-        
+        collection = db[chunks_collection_name]
+
         # Fetch all records
         records = list(collection.find())
-        
+
         # Convert to DataFrame
         if records:
             df = pd.DataFrame(records)
@@ -42,112 +43,225 @@ def get_mongodb_data():
             return df
         else:
             return pd.DataFrame()
-            
+
     except Exception as e:
-        st.error(f"Error connecting to MongoDB: {str(e)}")
+        st.error(f"Error connecting to MongoDB chunks collection: {str(e)}")
         return pd.DataFrame()
 
-def filter_data_by_range(df, x_range, y_range):
-    """Filter dataframe based on coordinate range"""
-    if x_range is None or y_range is None:
-        return df
-    
-    filtered_df = df[
-        (df['Xpca'] >= x_range[0]) & (df['Xpca'] <= x_range[1]) &
-        (df['Ypca'] >= y_range[0]) & (df['Ypca'] <= y_range[1])
-    ]
-    return filtered_df
+@st.cache_data(ttl=60)  # Cache for 60 seconds to allow dynamic updates
+def get_retrieval_logs(start_date=None, end_date=None, chunk_ids=None):
+    """Fetch retrieval logs from MongoDB with optional filters"""
+    try:
+        # Get MongoDB connection details from environment variables
+        mongo_uri = os.getenv("MONGODB_URI")
+        database_name = os.getenv("MONGODB_DATABASE")
+        logs_collection_name = os.getenv("MONGODB_LOGS_COLLECTION", "retrieval_logs")
+
+        # Connect to MongoDB
+        client = MongoClient(mongo_uri)
+        db = client[database_name]
+        collection = db[logs_collection_name]
+
+        # Build query filter
+        query = {}
+        if start_date or end_date:
+            query['timestamp'] = {}
+            if start_date:
+                query['timestamp']['$gte'] = start_date.isoformat()
+            if end_date:
+                query['timestamp']['$lte'] = end_date.isoformat()
+
+        if chunk_ids:
+            query['chunk_id'] = {'$in': chunk_ids}
+
+        # Fetch records
+        records = list(collection.find(query))
+
+        # Convert to DataFrame
+        if records:
+            df = pd.DataFrame(records)
+            # Convert ObjectId to string if present
+            if '_id' in df.columns:
+                df['_id'] = df['_id'].astype(str)
+            # Convert timestamp to datetime
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            return df
+        else:
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Error connecting to MongoDB retrieval_logs collection: {str(e)}")
+        return pd.DataFrame()
+
+def calculate_usage_counts(chunks_df, logs_df):
+    """Calculate usage count for each chunk based on retrieval logs"""
+    if logs_df.empty:
+        chunks_df['usage_count'] = 0
+        return chunks_df
+
+    # Count occurrences of each chunk_id in logs
+    usage_counts = logs_df['chunk_id'].value_counts().to_dict()
+
+    # Map usage counts to chunks
+    chunks_df['usage_count'] = chunks_df['id'].map(usage_counts).fillna(0).astype(int)
+
+    return chunks_df
+
+def get_lifetime_usage_count(chunk_id):
+    """Get lifetime (all-time) usage count for a specific chunk"""
+    try:
+        mongo_uri = os.getenv("MONGODB_URI")
+        database_name = os.getenv("MONGODB_DATABASE")
+        logs_collection_name = os.getenv("MONGODB_LOGS_COLLECTION", "retrieval_logs")
+
+        client = MongoClient(mongo_uri)
+        db = client[database_name]
+        collection = db[logs_collection_name]
+
+        count = collection.count_documents({'chunk_id': chunk_id})
+        return count
+    except Exception as e:
+        st.error(f"Error getting lifetime usage count: {str(e)}")
+        return 0
 
 def main():
     st.title("📊 Advanced PCA Visualization Dashboard")
+
     # Instructions
     with st.expander("ℹ️ How to use this dashboard"):
         st.markdown("""
         **Interactive Features:**
-        1. **Area Selection**: Use multiple selection modes to filter data - selected area automatically filters the table
-        2. **Search**: Filter records using the search box
-        3. **Download**: Export filtered data as CSV
-        
+        1. **Date Filter**: Select time range to analyze usage patterns
+        2. **Area Selection**: Use box/lasso/point selection to explore chunks
+        3. **Dynamic Metrics**: View aggregate statistics or individual chunk details
+
         **Chart Selection Modes:**
-        - 📦 **Box Select**: Click and drag to draw a rectangle around points 
+        - 📦 **Box Select**: Click and drag to draw a rectangle around points
         - 🎯 **Lasso Select**: Use the lasso tool in the toolbar to draw custom shapes around points
-        - 🔘 **Point Select**: Click individual points to select them (creates bounding box)
+        - 🔘 **Point Select**: Click individual points to select them
         - 🔄 **Pan**: Use pan mode to navigate the chart without selecting
         - 🔍 **Zoom**: Use zoom tools to focus on specific areas (default mode)
-        
-        **Plotly Toolbar:**
-        - Use the toolbar above the chart to switch between selection modes
-        - Hover over toolbar icons for tooltips explaining each tool
-        - Double-click the chart to reset zoom to original view
         """)
-    
-    # Initialize session state for zoom ranges
-    if 'x_range' not in st.session_state:
-        st.session_state.x_range = None
-    if 'y_range' not in st.session_state:
-        st.session_state.y_range = None
-    
+
+    # Initialize session state
+    if 'date_filter' not in st.session_state:
+        st.session_state.date_filter = 'all_time'
+    if 'custom_start_date' not in st.session_state:
+        st.session_state.custom_start_date = None
+    if 'custom_end_date' not in st.session_state:
+        st.session_state.custom_end_date = None
+
     # Sidebar for configuration
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
+
         # Refresh data button
         if st.button("🔄 Refresh Data"):
             st.cache_data.clear()
-            st.rerun()     
+            st.rerun()
 
-    
-    # Load data
-    with st.spinner("Loading data from MongoDB..."):
-        df = get_mongodb_data()
-    
-    if df.empty:
-        st.error("No data found or connection failed. Please check your MongoDB configuration.")
+    # Load chunks data
+    with st.spinner("Loading chunks from MongoDB..."):
+        chunks_df = get_chunks_data()
+
+    if chunks_df.empty:
+        st.error("No chunks found or connection failed. Please check your MongoDB configuration.")
         st.info("Make sure to set these environment variables in your .env file:")
         st.code("""
 MONGODB_URI=mongodb://localhost:27017/
 MONGODB_DATABASE=your_database_name
-MONGODB_COLLECTION=your_collection_name
+MONGODB_CHUNKS_COLLECTION=chunks
+MONGODB_LOGS_COLLECTION=retrieval_logs
         """)
         return
-    
+
     # Check if required columns exist
-    if 'Xpca' not in df.columns or 'Ypca' not in df.columns:
+    if 'Xpca' not in chunks_df.columns or 'Ypca' not in chunks_df.columns:
         st.error("Required columns 'Xpca' and 'Ypca' not found in the data.")
         st.info("Available columns:")
-        st.write(df.columns.tolist())
+        st.write(chunks_df.columns.tolist())
         return
-    
 
-    
-    # Add data summary to sidebar after data is loaded
+    # Add data summary to sidebar
     with st.sidebar:
         st.subheader("📋 Data Summary")
-        st.metric("Total Records", len(df))
-        
-        # Current zoom info
-        if st.session_state.x_range and st.session_state.y_range:
-            st.subheader("🔍 Current Zoom")
-            st.text(f"X: {st.session_state.x_range[0]:.2f} to {st.session_state.x_range[1]:.2f}")
-            st.text(f"Y: {st.session_state.y_range[0]:.2f} to {st.session_state.y_range[1]:.2f}")
+        st.metric("Total Chunks", len(chunks_df))
     
+    # Date Range Filter
+    st.subheader("📅 Date Range Filter")
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+    with col1:
+        if st.button("All Time", use_container_width=True, type="primary" if st.session_state.date_filter == 'all_time' else "secondary"):
+            st.session_state.date_filter = 'all_time'
+            st.rerun()
+    with col2:
+        if st.button("Last 24h", use_container_width=True, type="primary" if st.session_state.date_filter == '24h' else "secondary"):
+            st.session_state.date_filter = '24h'
+            st.rerun()
+    with col3:
+        if st.button("Last 7 days", use_container_width=True, type="primary" if st.session_state.date_filter == '7d' else "secondary"):
+            st.session_state.date_filter = '7d'
+            st.rerun()
+    with col4:
+        if st.button("Last 30 days", use_container_width=True, type="primary" if st.session_state.date_filter == '30d' else "secondary"):
+            st.session_state.date_filter = '30d'
+            st.rerun()
+    with col5:
+        if st.button("Last 90 days", use_container_width=True, type="primary" if st.session_state.date_filter == '90d' else "secondary"):
+            st.session_state.date_filter = '90d'
+            st.rerun()
+    with col6:
+        if st.button("Custom", use_container_width=True, type="primary" if st.session_state.date_filter == 'custom' else "secondary"):
+            st.session_state.date_filter = 'custom'
+            st.rerun()
+
+    # Custom date picker
+    start_date = None
+    end_date = None
+
+    if st.session_state.date_filter == 'custom':
+        col_start, col_end = st.columns(2)
+        with col_start:
+            start_date = st.date_input("Start Date", value=st.session_state.custom_start_date)
+            st.session_state.custom_start_date = start_date
+        with col_end:
+            end_date = st.date_input("End Date", value=st.session_state.custom_end_date)
+            st.session_state.custom_end_date = end_date
+
+        if start_date:
+            start_date = datetime.combine(start_date, datetime.min.time())
+        if end_date:
+            end_date = datetime.combine(end_date, datetime.max.time())
+    elif st.session_state.date_filter == '24h':
+        end_date = datetime.now()
+        start_date = end_date - timedelta(hours=24)
+    elif st.session_state.date_filter == '7d':
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+    elif st.session_state.date_filter == '30d':
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
+    elif st.session_state.date_filter == '90d':
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=90)
+
+    # Load retrieval logs based on date filter
+    with st.spinner("Loading retrieval logs..."):
+        logs_df = get_retrieval_logs(start_date, end_date)
+
+    # Calculate usage counts based on filtered logs
+    chunks_df = calculate_usage_counts(chunks_df, logs_df)
+
     # Scatterplot - Full width
     st.subheader("🎯 Interactive PCA Scatterplot")
 
-    # Reset zoom button above chart
-    if st.button("🔄 Reset Zoom", key="reset_zoom_top"):
-        st.session_state.x_range = None
-        st.session_state.y_range = None
-        st.rerun()
-
     # Prepare hover data - truncate long text for better display
-    df_plot = df.copy()
+    df_plot = chunks_df.copy()
     df_plot['question_short'] = df_plot['question'].apply(lambda x: str(x)[:100] + '...' if len(str(x)) > 100 else str(x))
     df_plot['answer_short'] = df_plot['answer'].apply(lambda x: str(x)[:100] + '...' if len(str(x)) > 100 else str(x))
-
-    # Ensure usage_count exists, default to 0 if missing
-    if 'usage_count' not in df_plot.columns:
-        df_plot['usage_count'] = 0
 
     # Create Plotly scatterplot with color coding based on usage_count
     fig = px.scatter(
@@ -209,193 +323,232 @@ MONGODB_COLLECTION=your_collection_name
     
     # Display the chart with selection events
     event = st.plotly_chart(
-        fig, 
-        use_container_width=True, 
+        fig,
+        use_container_width=True,
         key="pca_chart",
         on_select="rerun",
         selection_mode=['box', 'lasso', 'points']
     )
-    
-    # Handle selection events
+
+    # Handle selection events and determine state
     selected_chunk_indices = []
+    selected_chunks = []
 
-    if event and event.selection and event.selection.box:
-        # Extract box selection coordinates
-        box_data = event.selection.box[0]  # Get first box selection
-
-        if 'x' in box_data and 'y' in box_data:
-            # Extract selection coordinates from box and ensure proper min/max order
-            x_coords = box_data['x']
-            y_coords = box_data['y']
-
-            # Ensure we have min/max in correct order
-            x_range = [min(x_coords), max(x_coords)]
-            y_range = [min(y_coords), max(y_coords)]
-
-            # Update session state
-            st.session_state.x_range = x_range
-            st.session_state.y_range = y_range
-
-            st.success(f"🎯 Selected area: X: {x_range[0]:.4f} to {x_range[1]:.4f}, Y: {y_range[0]:.4f} to {y_range[1]:.4f}")
-
-    elif event and event.selection and event.selection.points:
-        # Handle point selections - get bounding box of selected points
+    if event and event.selection and event.selection.points:
+        # Handle point selections
         points = event.selection.points
         if points:
-            # Store selected point indices for chunk info display
             selected_chunk_indices = [point['point_index'] for point in points]
+            selected_chunks = [chunks_df.iloc[idx] for idx in selected_chunk_indices if idx < len(chunks_df)]
 
-            x_coords = [point['x'] for point in points]
-            y_coords = [point['y'] for point in points]
+    # Determine which state we're in
+    num_selected = len(selected_chunks)
 
-            x_range = [min(x_coords), max(x_coords)]
-            y_range = [min(y_coords), max(y_coords)]
+    st.markdown("---")
 
-            # Add small buffer if single point selected
-            if len(points) == 1:
-                x_buffer = 0.1
-                y_buffer = 0.1
-                x_range = [x_range[0] - x_buffer, x_range[1] + x_buffer]
-                y_range = [y_range[0] - y_buffer, y_range[1] + y_buffer]
+    # Dynamic Content Section based on selection state
+    if num_selected == 0:
+        # STATE 1: No Selection - Show aggregate metrics
+        display_aggregate_metrics(logs_df, "All Chunks")
 
-            # Update session state
-            st.session_state.x_range = x_range
-            st.session_state.y_range = y_range
+    elif num_selected == 1:
+        # STATE 3: Single Chunk Selected - Show chunk details and retrieval logs
+        chunk = selected_chunks[0]
+        chunk_id = chunk.get('id', 'N/A')
 
-            st.success(f"🎯 Selected {len(points)} point(s): X: {x_range[0]:.2f} to {x_range[1]:.2f}, Y: {y_range[0]:.2f} to {y_range[1]:.2f}")
+        # Section 1: Aggregate Metrics (in expander, collapsed)
+        chunk_logs = logs_df[logs_df['chunk_id'] == chunk_id] if not logs_df.empty else pd.DataFrame()
 
-    elif event and event.selection and event.selection.lasso:
-        # Handle lasso selections - get bounding box of lasso area
-        lasso_data = event.selection.lasso[0]
-        if 'x' in lasso_data and 'y' in lasso_data:
-            x_coords = lasso_data['x']
-            y_coords = lasso_data['y']
+        with st.expander("📊 Aggregate Metrics for This Chunk", expanded=False):
+            # Display metrics without nested expander
+            if chunk_logs.empty:
+                st.info("No retrieval logs found for this time period")
+            else:
+                # Metric cards
+                col1, col2 = st.columns(2)
 
-            x_range = [min(x_coords), max(x_coords)]
-            y_range = [min(y_coords), max(y_coords)]
+                with col1:
+                    st.metric("Total User Queries", len(chunk_logs))
 
-            # Update session state
-            st.session_state.x_range = x_range
-            st.session_state.y_range = y_range
+                with col2:
+                    avg_score = chunk_logs['similarity_score'].mean() if 'similarity_score' in chunk_logs.columns else 0
+                    st.metric("Average Similarity Score", f"{avg_score:.4f}")
 
-            st.success(f"🎯 Lasso selected area: X: {x_range[0]:.2f} to {x_range[1]:.2f}, Y: {y_range[0]:.2f} to {y_range[1]:.2f}")
+                # Similarity score distribution histogram
+                st.subheader("Similarity Score Distribution")
 
-    # Display Chunk Info Card for selected points
-    if selected_chunk_indices:
-        st.markdown("---")
-        st.subheader("📋 Selected Chunk Details")
+                if 'similarity_score' in chunk_logs.columns:
+                    # Create bins
+                    bins = [0, 0.6, 0.7, 0.8, 0.9, 1.0]
+                    labels = ['<0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1.0']
 
-        # Display info for each selected chunk
-        for idx in selected_chunk_indices:
-            if idx < len(df):
-                chunk = df.iloc[idx]
+                    chunk_logs_copy = chunk_logs.copy()
+                    chunk_logs_copy['score_bucket'] = pd.cut(chunk_logs_copy['similarity_score'], bins=bins, labels=labels, include_lowest=True)
+                    bucket_counts = chunk_logs_copy['score_bucket'].value_counts().reindex(labels, fill_value=0)
 
-                with st.container():
-                    st.markdown(f"""
-                    <div style="background-color: #f0f2f6; padding: 10px 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #00FF00;">
-                        <p style="margin: 0; font-size: 14px; font-weight: 600; color: #1f77b4;">🔖 Chunk ID: {chunk.get('id', 'N/A')}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Create histogram
+                    fig_hist = go.Figure(data=[
+                        go.Bar(
+                            x=labels,
+                            y=bucket_counts.values,
+                            marker_color='#1f77b4'
+                        )
+                    ])
 
-                    col1, col2 = st.columns(2)
+                    fig_hist.update_layout(
+                        xaxis_title="Similarity Score Range",
+                        yaxis_title="Count of Retrievals",
+                        height=400,
+                        showlegend=False
+                    )
 
-                    with col1:
-                        st.markdown("**📍 PCA Coordinates**")
-                        st.write(f"• X: `{chunk.get('Xpca', 'N/A'):.6f}`")
-                        st.write(f"• Y: `{chunk.get('Ypca', 'N/A'):.6f}`")
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                else:
+                    st.warning("No similarity_score data available")
 
-                    with col2:
-                        st.markdown("**📊 Lifetime Usage Count**")
-                        usage = chunk.get('usage_count', 0)
-                        st.markdown(f"<h2 style='color: #00FF00; margin: 0;'>{usage}</h2>", unsafe_allow_html=True)
+        # Section 2: Chunk Details (expanded)
+        st.subheader("📋 Chunk Details")
+        display_chunk_info_card(chunk, get_lifetime_usage_count(chunk_id))
 
-                    st.markdown("---")
+        # Retrieval Logs Table
+        st.subheader("📜 Retrieval Logs")
+        display_retrieval_logs_table(chunk_id, start_date, end_date)
 
-                    st.markdown("**❓ Question**")
-                    st.info(chunk.get('question', 'N/A'))
-
-                    st.markdown("**💡 Answer**")
-                    st.success(chunk.get('answer', 'N/A'))
-
-                    if len(selected_chunk_indices) > 1:
-                        st.markdown("---")
-
-        st.markdown("---")
-    
-
-    
-    # Show current filter status
-    if st.session_state.x_range and st.session_state.y_range:
-        st.info(f"📍 Active filter: X: {st.session_state.x_range[0]:.2f} to {st.session_state.x_range[1]:.2f}, Y: {st.session_state.y_range[0]:.2f} to {st.session_state.y_range[1]:.2f}")
-    
-
-    
-    # Filter data based on current zoom
-    if st.session_state.x_range and st.session_state.y_range:
-        filtered_df = filter_data_by_range(df, st.session_state.x_range, st.session_state.y_range)
-        st.subheader(f"📊 Records in Current Zoom ({len(filtered_df)} records)")
     else:
-        filtered_df = df
-        st.subheader("📊 All Records")
+        # STATE 2: Multiple Chunks Selected - Show filtered aggregate metrics
+        selected_chunk_ids = [chunk.get('id') for chunk in selected_chunks]
+        filtered_logs = logs_df[logs_df['chunk_id'].isin(selected_chunk_ids)] if not logs_df.empty else pd.DataFrame()
+        display_aggregate_metrics(filtered_logs, f"{num_selected} Selected Chunks")
     
-    # Add search functionality
-    search_term = st.text_input("🔍 Search records:", placeholder="Enter search term...")
-    
-    # Apply search filter
-    display_df = filtered_df.copy()
-    if search_term:
-        # Search across all text columns
-        text_columns = filtered_df.select_dtypes(include=['object']).columns
-        if len(text_columns) > 0:
-            mask = filtered_df[text_columns].astype(str).apply(
-                lambda x: x.str.contains(search_term, case=False, na=False)
-            ).any(axis=1)
-            display_df = filtered_df[mask]
-            st.info(f"Found {len(display_df)} records matching '{search_term}'")
-    
-    # Display the table
-    if not display_df.empty:
-        # Column selection
-        all_columns = display_df.columns.tolist()
-        default_columns = ['Xpca', 'Ypca'] + [col for col in all_columns if col not in ['Xpca', 'Ypca', '_id']][:5]
-        selected_columns = st.multiselect(
-            "Select columns to display:",
-            all_columns,
-            default=default_columns[:7]
-        )
-        
-        if selected_columns:
-            # Display table with sorting
-            st.dataframe(
-                display_df[selected_columns].sort_values('Xpca'),
-                use_container_width=True,
-                height=400
+def display_aggregate_metrics(logs_df, title):
+    """Display aggregate metrics for retrieval logs"""
+    with st.expander(f"� Aggregate Metrics - {title}", expanded=True):
+        if logs_df.empty:
+            st.info("No retrieval logs found for this time period")
+            return
+
+        # Metric cards
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric("Total User Queries", len(logs_df))
+
+        with col2:
+            avg_score = logs_df['similarity_score'].mean() if 'similarity_score' in logs_df.columns else 0
+            st.metric("Average Similarity Score", f"{avg_score:.4f}")
+
+        # Similarity score distribution histogram
+        st.subheader("Similarity Score Distribution")
+
+        if 'similarity_score' in logs_df.columns:
+            # Create bins
+            bins = [0, 0.6, 0.7, 0.8, 0.9, 1.0]
+            labels = ['<0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1.0']
+
+            logs_df['score_bucket'] = pd.cut(logs_df['similarity_score'], bins=bins, labels=labels, include_lowest=True)
+            bucket_counts = logs_df['score_bucket'].value_counts().reindex(labels, fill_value=0)
+
+            # Create histogram
+            fig_hist = go.Figure(data=[
+                go.Bar(
+                    x=labels,
+                    y=bucket_counts.values,
+                    marker_color='#1f77b4'
+                )
+            ])
+
+            fig_hist.update_layout(
+                xaxis_title="Similarity Score Range",
+                yaxis_title="Count of Retrievals",
+                height=400,
+                showlegend=False
             )
-            
-            # Statistics for filtered data
-            if len(selected_columns) >= 2:
-                stats_col1, stats_col2, stats_col3 = st.columns(3)
-                with stats_col1:
-                    st.metric("Filtered Records", len(display_df))
-                with stats_col2:
-                    if 'Xpca' in selected_columns:
-                        st.metric("Avg X", f"{display_df['Xpca'].mean():.2f}")
-                with stats_col3:
-                    if 'Ypca' in selected_columns:
-                        st.metric("Avg Y", f"{display_df['Ypca'].mean():.2f}")
-            
-            # Download button
-            csv = display_df[selected_columns].to_csv(index=False)
-            st.download_button(
-                label="📥 Download filtered data as CSV",
-                data=csv,
-                file_name=f"pca_data_filtered_{len(display_df)}_records.csv",
-                mime="text/csv"
-            )
+
+            st.plotly_chart(fig_hist, use_container_width=True)
         else:
-            st.warning("Please select at least one column to display.")
-    else:
-        st.warning("No records found with current filters.")
+            st.warning("No similarity_score data available")
+
+def display_chunk_info_card(chunk, lifetime_usage):
+    """Display detailed chunk information card"""
+    chunk_id = chunk.get('id', 'N/A')
+
+    st.markdown(f"""
+    <div style="background-color: #f0f2f6; padding: 10px 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #00FF00;">
+        <p style="margin: 0; font-size: 14px; font-weight: 600; color: #1f77b4;">🔖 Chunk ID: {chunk_id}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**📍 PCA Coordinates**")
+        st.write(f"• X: `{chunk.get('Xpca', 'N/A'):.6f}`")
+        st.write(f"• Y: `{chunk.get('Ypca', 'N/A'):.6f}`")
+
+    with col2:
+        st.markdown("**📊 Lifetime Usage Count**")
+        st.markdown(f"<h2 style='color: #00FF00; margin: 0;'>{lifetime_usage}</h2>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    st.markdown("**❓ Question**")
+    st.info(chunk.get('question', 'N/A'))
+
+    st.markdown("**💡 Answer**")
+    st.success(chunk.get('answer', 'N/A'))
+
+def display_retrieval_logs_table(chunk_id, start_date, end_date):
+    """Display paginated retrieval logs table for a specific chunk"""
+    # Initialize pagination state
+    if 'logs_page' not in st.session_state:
+        st.session_state.logs_page = 0
+
+    # Get logs for this chunk
+    logs_df = get_retrieval_logs(start_date, end_date, [chunk_id])
+
+    if logs_df.empty:
+        st.info("No retrievals found for this chunk in the selected time period")
+        return
+
+    # Sort by timestamp (most recent first) by default
+    logs_df = logs_df.sort_values('timestamp', ascending=False)
+
+    # Pagination
+    page_size = 10
+    total_pages = (len(logs_df) - 1) // page_size + 1
+    start_idx = st.session_state.logs_page * page_size
+    end_idx = min(start_idx + page_size, len(logs_df))
+
+    # Display table
+    display_logs = logs_df.iloc[start_idx:end_idx][['timestamp', 'user_query', 'similarity_score']].copy()
+    display_logs['timestamp'] = display_logs['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    st.dataframe(
+        display_logs,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "timestamp": st.column_config.TextColumn("Timestamp", width="medium"),
+            "user_query": st.column_config.TextColumn("User Query", width="large"),
+            "similarity_score": st.column_config.NumberColumn("Similarity Score", format="%.4f", width="small")
+        }
+    )
+
+    # Pagination controls
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col1:
+        if st.button("⬅️ Previous", disabled=(st.session_state.logs_page == 0)):
+            st.session_state.logs_page -= 1
+            st.rerun()
+
+    with col2:
+        st.markdown(f"<p style='text-align: center;'>Page {st.session_state.logs_page + 1} of {total_pages} ({len(logs_df)} total records)</p>", unsafe_allow_html=True)
+
+    with col3:
+        if st.button("Next ➡️", disabled=(st.session_state.logs_page >= total_pages - 1)):
+            st.session_state.logs_page += 1
+            st.rerun()
 
 if __name__ == "__main__":
-    main() 
+    main()
